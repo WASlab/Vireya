@@ -5,7 +5,7 @@ from typing import Tuple,Optional,Literal
 from dataclasses import dataclass
 from torch import Tensor
 import math
-from vireya.models.kernel import act_quant, weight_dequant, fp8_gemm
+from kernel import act_quant, weight_dequant, fp8_gemm
 import torch.distributed as dist
 
 @dataclass

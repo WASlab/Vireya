@@ -1,0 +1,37 @@
+# Ignore Python cache and metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Ignore virtual environments (if created inside repo)
+.venv/
+venv/
+
+# Ignore local datasets, logs, and run outputs
+data/
+runs/
+wandb/
+
+# Ignore Jupyter notebook checkpoints if applicable
+.ipynb_checkpoints/
+
+# Ignore temporary files and OS cruft
+*.log
+.DS_Store
+Thumbs.db
+
+# Ignore compiled C/C++/CUDA files
+*.so
+*.dylib
+*.dll
+*.o
+*.out
+*.ptx
+
+# Ignore PyTorch Lightning (if ever used)
+lightning_logs/
+
+# Ignore pyproject.toml lockfiles (optional)
+poetry.lock
+Pipfile.lock

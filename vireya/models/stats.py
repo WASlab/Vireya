@@ -1,7 +1,7 @@
 # model_stats.py
 
 import torch
-from model import ModelArgs, Transformer 
+from vireya.models.model import ModelArgs, Transformer 
 
 def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())

@@ -5,7 +5,7 @@ from typing import Tuple,Optional,Literal
 from dataclasses import dataclass
 from torch import Tensor
 import math
-from kernel import act_quant, weight_dequant, fp8_gemm
+from vireya.models.kernel import act_quant, weight_dequant, fp8_gemm
 import torch.distributed as dist
 
 @dataclass
@@ -91,10 +91,10 @@ class ModelArgs:
     world_size = 1
     rank = 0
     block_size = 128
-    gemm_impl: Literal["bf16", "fp8"] = "bf16"
+    dtype: Literal["bf16", "fp8"] = "bf16"
     attn_impl: Literal["naive", "absorb"] = "absorb"
     
-    dtype = gemm_impl
+   
     max_batch_size = 1
 class PatchEmbedding(nn.Module):
     """
@@ -128,11 +128,14 @@ class PatchEmbedding(nn.Module):
         assert self.image_size % self.patch_size == 0, "Image size must be divisible by patch size."
 
         self.projection = nn.Conv2d(
-            in_channels=3,
-            out_channels=self.dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size
-        )
+        in_channels=3,
+        out_channels=self.dim,
+        kernel_size=self.patch_size,
+        stride=self.patch_size,
+        bias=True,
+        dtype=Linear.dtype  # Match model precision (bf16 or fp8)
+    )
+
 
         if self.use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, self.dim))
@@ -251,7 +254,8 @@ class Linear(nn.Module):
         else:
             self.register_parameter("scale", None)
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=self.weight.dtype))
+
         else:
             self.register_parameter("bias", None)
 
@@ -331,113 +335,139 @@ class RowParallelLinear(Linear):
     
 class MLA(nn.Module):
     """
-    Multi-Headed Attention Layer (MLA).
+    Multi-Headed Latent Attention (MLA) Layer adapted for vision transformers using RoPE-Mixed.
 
-    Attributes:
-        dim (int): Dimensionality of the input features.
-        n_heads (int): Number of attention heads.
-        n_local_heads (int): Number of local attention heads for distributed systems.
-        q_lora_rank (int): Rank for low-rank query projection.
-        kv_lora_rank (int): Rank for low-rank key/value projection.
-        qk_nope_head_dim (int): Dimensionality of non-positional query/key projections.
-        qk_rope_head_dim (int): Dimensionality of rotary-positional query/key projections.
-        qk_head_dim (int): Total dimensionality of query/key projections.
-        v_head_dim (int): Dimensionality of value projections.
-        softmax_scale (float): Scaling factor for softmax in attention computation.
+    Supports LoRA-style KV compression and optional rotary embeddings on a per-head subset of dimensions.
+
+    Args:
+        args (ModelArgs): Configuration for the model.
     """
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // world_size
+
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
+
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
+        self.v_head_dim = args.v_head_dim
+        self.softmax_scale = self.qk_head_dim ** -0.5
+
+        if args.max_seq_len > args.original_seq_len:
+            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
+            self.softmax_scale *= mscale * mscale
+
+        # Query projection
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = DyT(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+
+        # Key/Value low-rank pre-projection and decomposition
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = DyT(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
-        self.softmax_scale = self.qk_head_dim ** -0.5
-        if args.max_seq_len > args.original_seq_len:
-            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+
+        # Cache buffers for inference
         if attn_impl == "naive":
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
-            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
-            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
+            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_nope_head_dim), persistent=False)
+            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_rope_head_dim), persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
-        Forward pass for the Multi-Headed Attention Layer (MLA) using RoPE-Mixed.
+        Forward pass for MLA.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            start_pos (int): Starting position in the sequence for caching.
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
-            mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            x (Tensor): Input tensor of shape (B, T, dim).
+            start_pos (int): Starting position in the sequence.
+            freqs_cis (Tensor): RoPE frequency tensor for rotary embedding.
+            mask (Optional[Tensor]): Attention mask (causal or padding).
 
         Returns:
-            torch.Tensor: Output tensor with the same shape as the input.
+            Tensor: Output tensor of shape (B, T, dim).
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+
+        # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        
-        # Apply RoPE-Mixed to the first qk_rope_head_dim dimensions per head
-        q_rope, q_rest = q[..., :self.qk_rope_head_dim], q[..., self.qk_rope_head_dim:]
+        q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_rope = apply_rotary_emb(q_rope, freqs_cis)
-        q = torch.cat([q_rope, q_rest], dim=-1)
 
+        # Key/value compression
         kv = self.wkv_a(x)
         kv, k_rope = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)  # shape: (B, T, 1, D) -> expand later
 
         if attn_impl == "naive":
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_rest, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_rope.expand(-1, -1, self.n_local_heads, -1), k_rest], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
+            # Project k/v fully
+            kv_proj = self.wkv_b(self.kv_norm(kv))
+            kv_proj = kv_proj.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_full = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
+            self.k_cache[:bsz, start_pos:end_pos] = k_full
             self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_proj = torch.einsum("bshd,hdc->bshc", q, wkv_b)
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_rope.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_proj[..., self.qk_rope_head_dim:], self.kv_cache[:bsz, :end_pos]) +
-                    torch.einsum("bshc,btc->bsht", q_proj[..., :self.qk_rope_head_dim], self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
 
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+            q_full = torch.cat([q_nope, q_rope], dim=-1)
+            scores = torch.einsum("bshd,bthd->bsht", q_full, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+            attn_out = torch.einsum("bsht,bthd->bshd", scores.softmax(dim=-1), self.v_cache[:bsz, :end_pos])
 
-        if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
-        
-        x = self.wo(x.flatten(2))
+            # Compressed cache path
+            kv_proj = self.kv_norm(kv)  # (B, T, kv_lora_rank)
+            kv_proj = self.wkv_b(kv_proj)
+            kv_proj = kv_proj.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            self.kv_cache[:bsz, start_pos:end_pos] = k_nope.detach()
+            self.pe_cache[:bsz, start_pos:end_pos] = k_rope.expand(-1, -1, self.n_local_heads, -1).detach()
+
+            scores = (
+            torch.einsum("bshc,bthc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+            torch.einsum("bshc,bthc->bsht", q_rope, self.pe_cache[:bsz, :end_pos])
+        ) * self.softmax_scale
+
+            attn_out = torch.einsum("bsht,bthc->bshc", scores.softmax(dim=-1), self.kv_cache[:bsz, :end_pos])
+            wkv_b_weight = self.wkv_b.weight  # [kv_lora_rank, n_heads * (qk_nope + v)]
+            if self.wkv_b.scale is not None:
+                wkv_b_weight = weight_dequant(wkv_b_weight, self.wkv_b.scale, block_size)
+
+            # Reshape to: [n_heads, qk_nope + v, kv_lora_rank]
+            wkv_b_weight = wkv_b_weight.t().contiguous().view(
+                self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+            )
+
+            # Extract value projection weights: [n_heads, v_head_dim, kv_lora_rank]
+            v_proj_w = wkv_b_weight[:, -self.v_head_dim:, :]  # this is v_proj
+
+            # Transpose for matmul shape: [n_heads, kv_lora_rank, v_head_dim]
+            v_proj_w = v_proj_w.transpose(-2, -1).contiguous()  # now [n_heads, kv_lora_rank, v_head_dim]
+
+            # attn_out: [B, S, n_heads, kv_lora_rank]
+            # v_proj_w: [n_heads, kv_lora_rank, v_head_dim]
+            attn_out = torch.einsum("bshc,hcd->bshd", attn_out, v_proj_w)
+
+
+        x = self.wo(attn_out.flatten(2))
         return x
+
 
     
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
@@ -522,21 +552,22 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
-
-    Args:
-        x (torch.Tensor): Input tensor with positional embeddings to be applied.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
-
-    Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
-    """
     dtype = x.dtype
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
-    return y.to(dtype)
+    bsz, seqlen, n_heads, dim = x.shape
+    assert dim % 2 == 0
+
+    # x: [bsz, seqlen, n_heads, dim//2, 2] → complex
+    x_complex = torch.view_as_complex(x.float().reshape(bsz, seqlen, n_heads, dim//2, 2))
+
+    # Always slice (do NOT reshape freqs_cis here!)
+    freqs = freqs_cis[:seqlen].unsqueeze(0).unsqueeze(2)  # [1, seqlen, 1, dim//2] 
+
+    out = x_complex * freqs
+
+    out = torch.view_as_real(out).type(dtype)
+    return out.reshape(bsz, seqlen, n_heads, dim)
+
+
 
 class MLP(nn.Module):
     """
@@ -776,64 +807,86 @@ class Block(nn.Module):
 
 class Transformer(nn.Module):
     """
-    Transformer model with positional embeddings, multiple layers, and output projection.
+    Transformer model for vision tasks with support for RoPE-based attention, Mixture-of-Experts (MoE),
+    and modular attention/feedforward layers. The architecture uses dynamic rotary embedding handling,
+    supports distributed training, and includes a learnable patch embedding layer.
 
     Attributes:
-        max_seq_len (int): Maximum sequence length for the transformer.
-        embed (nn.Module): Embedding layer for input tokens.
-        layers (torch.nn.ModuleList): List of transformer blocks.
-        norm (nn.Module): Layer normalization applied after all blocks.
-        head (nn.Module): Output projection layer mapping to vocabulary size.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+        args (ModelArgs): Configuration object specifying model parameters.
+        embed (PatchEmbedding): Converts input images into patch tokens with optional cls_token.
+        layers (nn.ModuleList): A sequence of Transformer blocks (attention + MLP or MoE).
+        norm (DyT): Final normalization layer before the classifier head.
+        head (nn.Linear): Linear layer mapping the final representation to output logits.
+        freqs_cis (Tensor): Buffer containing precomputed complex rotary embedding values.
     """
     def __init__(self, args: ModelArgs):
-        """
-        Initializes the Transformer model.
-
-        Args:
-            args (ModelArgs): Model arguments containing transformer parameters.
-        """
+        super().__init__()
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Set the default dtype globally for all Linear layers
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
-        super().__init__()
-        self.max_seq_len = args.max_seq_len
+        self.args = args
+
+        # Image → patch embedding with optional class token
         self.embed = PatchEmbedding(args, use_cls_token=True)
 
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(args.n_layers):
-            self.layers.append(Block(layer_id, args))
+        # Stack of Transformer blocks
+        self.layers = nn.ModuleList([
+            Block(i, args) for i in range(args.n_layers)
+        ])
+
+        # Normalization before classification head
         self.norm = DyT(args.dim)
-        self.head = nn.Linear(args.dim, args.num_classes)
 
+        # Final projection to num_classes
+        self.head = Linear(args.dim, args.num_classes,bias=True)
 
+        # Precompute rotary embeddings up to max_seq_len
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """
         Forward pass for the Transformer model.
 
         Args:
-            tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
-            start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
+            tokens (torch.Tensor): Input tensor of shape (B, C, H, W) representing image batches.
+            start_pos (int, optional): Start position for positional encodings. Defaults to 0.
 
         Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
+            torch.Tensor: Output logits of shape (B, num_classes).
         """
-        seqlen = tokens.size(1)
+        
+        # tokens should be [B, T, dim] after PatchEmbedding
+
+        # Patch embedding + cls_token (if enabled)
         h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        seqlen = h.size(1)
+        # Slice the correct amount of rotary embeddings for the current sequence length
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        # Causal attention mask if sequence length > 1
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
+        # Forward through transformer layers
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
+
+        # Final norm and select the last token (usually cls_token)
+        h = self.norm(h)[:, -1]  # shape: (B, dim)
+
+        # Project to class logits
         logits = self.head(h)
+
+        # Optional distributed gather across devices
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
+
         return logits
+
+

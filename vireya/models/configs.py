@@ -18,6 +18,7 @@ def tiny_config(dtype: str = "bf16") -> ModelArgs:
         n_activated_experts=2,
         qk_nope_head_dim=16,
         qk_rope_head_dim=16,
+        kv_lora_rank=16,
         v_head_dim=32,
         max_seq_len=seq_len + 1,
         original_seq_len=seq_len,

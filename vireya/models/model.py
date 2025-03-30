@@ -50,52 +50,132 @@ class ModelArgs:
         # Data types and distributed
         dtype (Literal['bf16','fp8']): Computation precision.
         world_size (int): Number of distributed processes (for parallel linear).
+        rank (int): Rank of the current process (for distributed).
         max_batch_size (int): Max batch size for memory caching, etc.
     """
-    # Vision
-    image_size: int = 224
-    patch_size: int = 16
-    num_classes: int = 1000
+    def __init__(self, 
+                 image_size: int = 224, 
+                 patch_size: int = 16,
+                 num_classes: int = 1000,
+                 dim: int = 768,
+                 inter_dim: int = 3072,
+                 moe_inter_dim: int = 2048,
+                 n_layers: int = 12,
+                 n_dense_layers: int = 2,
+                 n_heads: int = 12,
+                 n_routed_experts: int = 16,
+                 n_shared_experts: int = 2,
+                 n_activated_experts: int = 2,
+                 n_expert_groups: int = 1,
+                 n_limited_groups: int = 1,
+                 score_func: Literal["softmax", "sigmoid"] = "softmax",
+                 route_scale: float = 1.0,
+                 q_lora_rank: int = 0,
+                 kv_lora_rank: int = 0,
+                 qk_nope_head_dim: int = 32,
+                 qk_rope_head_dim: int = 32,
+                 v_head_dim: int = 64,
+                 max_seq_len: int = (224 // 16) ** 2,
+                 original_seq_len: int = 196,
+                 rope_theta: float = 10000.0,
+                 rope_factor: float = 1.0,
+                 beta_fast: int = 32,
+                 beta_slow: int = 1,
+                 mscale: float = 1.0,
+                 world_size: int = 1,
+                 rank: int = 0,
+                 block_size: int = 128,
+                 dtype: Literal["bf16", "fp8"] = "bf16",
+                 attn_impl: Literal["naive", "absorb"] = "absorb",
+                 max_batch_size: int = 1):
+        """
+        Initialize the model arguments and hyperparameters.
+        
+        Args:
+            image_size: Image resolution.
+            patch_size: Size of the patches for patch embeddings.
+            num_classes: Number of classes for classification.
+            dim: Model dimension.
+            inter_dim: Intermediate dimension for MLP layers.
+            moe_inter_dim: MoE expert intermediate dimension.
+            n_layers: Number of transformer layers.
+            n_dense_layers: Number of dense layers before MoE.
+            n_heads: Number of attention heads.
+            n_routed_experts: Number of routed experts in MoE.
+            n_shared_experts: Number of shared experts in MoE.
+            n_activated_experts: Number of activated experts.
+            n_expert_groups: Number of expert groups for routing.
+            n_limited_groups: Number of groups that route tokens.
+            score_func: Scoring function for gating mechanism.
+            route_scale: Scaling factor for gating scores.
+            q_lora_rank: LoRA rank for query projections.
+            kv_lora_rank: LoRA rank for key-value projections.
+            qk_nope_head_dim: Dimension for non-positional Q/K heads.
+            qk_rope_head_dim: Dimension for rotary Q/K heads.
+            v_head_dim: Dimension for value projections.
+            max_seq_len: Maximum sequence length.
+            original_seq_len: Original sequence length for RoPE.
+            rope_theta: Base for rotary positional encoding.
+            rope_factor: Scaling factor for RoPE.
+            beta_fast: Fast beta for partial RoPE corrections.
+            beta_slow: Slow beta for partial RoPE corrections.
+            mscale: Scaling factor for extended attention.
+            world_size: Number of distributed processes (for parallel linear).
+            rank: Rank of the current process (for distributed).
+            block_size: Size of blocks for quantization.
+            dtype: Data type for computations (bf16 or fp8).
+            attn_impl: Attention implementation (naive or absorb).
+            max_batch_size: Maximum batch size for memory caching.
+        """
+        # Vision and transformer settings
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_classes = num_classes
+        self.dim = dim
+        self.inter_dim = inter_dim
+        self.moe_inter_dim = moe_inter_dim
+        self.n_layers = n_layers
+        self.n_dense_layers = n_dense_layers
+        self.n_heads = n_heads
 
-    # Transformer dims
-    dim: int = 768
-    inter_dim: int = 3072
-    moe_inter_dim: int = 2048
-    n_layers: int = 12
-    n_dense_layers: int = 2
-    n_heads: int = 12
+        # MoE parameters
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.n_activated_experts = n_activated_experts
+        self.n_expert_groups = n_expert_groups
+        self.n_limited_groups = n_limited_groups
+        self.score_func = score_func
+        self.route_scale = route_scale
 
-    # MoE
-    n_routed_experts: int = 16
-    n_shared_experts: int = 2
-    n_activated_experts: int = 2
-    n_expert_groups: int = 1
-    n_limited_groups: int = 1
-    score_func: Literal["softmax", "sigmoid"] = "softmax"
-    route_scale: float = 1.0
+        # MLA + RoPE parameters
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.max_seq_len = max_seq_len
+        self.original_seq_len = original_seq_len
+        self.rope_theta = rope_theta
+        self.rope_factor = rope_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
 
-    # MLA + RoPE
-    q_lora_rank: int = 0
-    kv_lora_rank: int = 0
-    qk_nope_head_dim: int = 32
-    qk_rope_head_dim: int = 32
-    v_head_dim: int = 64
-    max_seq_len: int = (224 // 16) ** 2  # 14x14 = 196 by default
-    original_seq_len: int = 196
-    rope_theta: float = 10000.0
-    rope_factor: float = 1.0
-    beta_fast: int = 32
-    beta_slow: int = 1
-    mscale: float = 1.0
+        # Distributed settings
+        self.world_size = world_size
+        self.rank = rank
+        self.block_size = block_size
+        self.dtype = dtype
+        self.attn_impl = attn_impl
 
-    world_size = 1
-    rank = 0
-    block_size = 128
-    dtype: Literal["bf16", "fp8"] = "bf16"
-    attn_impl: Literal["naive", "absorb"] = "absorb"
-    
-   
-    max_batch_size = 1
+        # Batch size setting
+        self.max_batch_size = max_batch_size
+
+    # Optional method to add further initialization logic (e.g., randomization)
+    def initialize(self):
+        # Placeholder method if you want to initialize or update any parameters
+        pass
+
 class PatchEmbedding(nn.Module):
     """
     Patch embedding layer for transforming image patches into a sequence of embeddings.
@@ -141,7 +221,13 @@ class PatchEmbedding(nn.Module):
             self.cls_token = nn.Parameter(torch.zeros(1, 1, self.dim))
         else:
             self.register_parameter("cls_token", None)
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        # Delegate initialization to Conv2d and cls_token
+        self.projection.reset_parameters()
+        if self.cls_token is not None:
+            nn.init.zeros_(self.cls_token)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the PatchEmbedding layer.
@@ -166,6 +252,8 @@ class PatchEmbedding(nn.Module):
             x = torch.cat((cls_tokens, x), dim=1)          # (B, N_patches+1, dim)
 
         return x
+    
+
 
 world_size: int = 1
 rank: int = 0
@@ -258,6 +346,16 @@ class Linear(nn.Module):
 
         else:
             self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Standard Xavier init for weights, zero bias
+        if self.weight is not None:
+            nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+        if hasattr(self, "scale") and self.scale is not None:
+            nn.init.ones_(self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -286,6 +384,16 @@ class ColumnParallelLinear(Linear):
         assert out_features % world_size == 0, f"Output features must be divisible by world size (world_size={world_size})"
         self.part_out_features = out_features // world_size
         super().__init__(in_features, self.part_out_features, bias, dtype)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Standard Xavier init for weights, zero bias
+        if self.weight is not None:
+            nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+        if hasattr(self, "scale") and self.scale is not None:
+            nn.init.ones_(self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -315,6 +423,16 @@ class RowParallelLinear(Linear):
         assert in_features % world_size == 0, f"Input features must be divisible by world size (world_size={world_size})"
         self.part_in_features = in_features // world_size
         super().__init__(self.part_in_features, out_features, bias, dtype)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Standard Xavier init for weights, zero bias
+        if self.weight is not None:
+            nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+        if hasattr(self, "scale") and self.scale is not None:
+            nn.init.ones_(self.scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -384,6 +502,10 @@ class MLA(nn.Module):
         else:
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_nope_head_dim), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_rope_head_dim), persistent=False)
+        for name, param in self.named_parameters():
+            
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"Param {name} has NaN or Inf")
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
@@ -400,23 +522,32 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+        print("Input x NaN:", torch.isnan(x).any())
+        print("x", x.dtype, x.shape)
+        print("wq weight", self.wq.weight.dtype, self.wq.weight.shape)
 
         # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        print("Q projection NaN:", torch.isnan(q).any())
+
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        print("Q_nope NaN:", torch.isnan(q_nope).any())
+        print("Q_rope NaN:", torch.isnan(q_rope).any())
 
         # Key/value compression
         kv = self.wkv_a(x)
         kv, k_rope = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)  # shape: (B, T, 1, D) -> expand later
+        print("KV compression NaN:", torch.isnan(kv).any())
+
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)  # shape: (B, T, 1, D)
+        print("K_rope expanded NaN:", torch.isnan(k_rope).any())
 
         if attn_impl == "naive":
-            # Project k/v fully
             kv_proj = self.wkv_b(self.kv_norm(kv))
             kv_proj = kv_proj.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -427,11 +558,13 @@ class MLA(nn.Module):
 
             q_full = torch.cat([q_nope, q_rope], dim=-1)
             scores = torch.einsum("bshd,bthd->bsht", q_full, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+            print("Scores NaN (naive/compressed):", torch.isnan(scores).any())
+            print("Scores max:", scores.max())
+            print("Scores min:", scores.min())
             attn_out = torch.einsum("bsht,bthd->bshd", scores.softmax(dim=-1), self.v_cache[:bsz, :end_pos])
-
+            print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
         else:
-            # Compressed cache path
-            kv_proj = self.kv_norm(kv)  # (B, T, kv_lora_rank)
+            kv_proj = self.kv_norm(kv)
             kv_proj = self.wkv_b(kv_proj)
             kv_proj = kv_proj.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -440,33 +573,37 @@ class MLA(nn.Module):
             self.pe_cache[:bsz, start_pos:end_pos] = k_rope.expand(-1, -1, self.n_local_heads, -1).detach()
 
             scores = (
-            torch.einsum("bshc,bthc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-            torch.einsum("bshc,bthc->bsht", q_rope, self.pe_cache[:bsz, :end_pos])
-        ) * self.softmax_scale
+                torch.einsum("bshc,bthc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                torch.einsum("bshc,bthc->bsht", q_rope, self.pe_cache[:bsz, :end_pos])
+            ) * self.softmax_scale
+
+            print("Scores NaN (compressed):", torch.isnan(scores).any())
+            print("kv_cache NaN:", torch.isnan(self.kv_cache[:bsz, :end_pos]).any())
+            print("pe_cache NaN:", torch.isnan(self.pe_cache[:bsz, :end_pos]).any())
 
             attn_out = torch.einsum("bsht,bthc->bshc", scores.softmax(dim=-1), self.kv_cache[:bsz, :end_pos])
-            wkv_b_weight = self.wkv_b.weight  # [kv_lora_rank, n_heads * (qk_nope + v)]
+
+            wkv_b_weight = self.wkv_b.weight
             if self.wkv_b.scale is not None:
                 wkv_b_weight = weight_dequant(wkv_b_weight, self.wkv_b.scale, block_size)
 
-            # Reshape to: [n_heads, qk_nope + v, kv_lora_rank]
             wkv_b_weight = wkv_b_weight.t().contiguous().view(
                 self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
             )
 
-            # Extract value projection weights: [n_heads, v_head_dim, kv_lora_rank]
-            v_proj_w = wkv_b_weight[:, -self.v_head_dim:, :]  # this is v_proj
+            v_proj_w = wkv_b_weight[:, -self.v_head_dim:, :]
+            v_proj_w = v_proj_w.transpose(-2, -1).contiguous()
 
-            # Transpose for matmul shape: [n_heads, kv_lora_rank, v_head_dim]
-            v_proj_w = v_proj_w.transpose(-2, -1).contiguous()  # now [n_heads, kv_lora_rank, v_head_dim]
+            print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
+            print("v_proj_w NaN:", torch.isnan(v_proj_w).any())
 
-            # attn_out: [B, S, n_heads, kv_lora_rank]
-            # v_proj_w: [n_heads, kv_lora_rank, v_head_dim]
             attn_out = torch.einsum("bshc,hcd->bshd", attn_out, v_proj_w)
 
-
+        print("Final attn_out NaN:", torch.isnan(attn_out).any())
         x = self.wo(attn_out.flatten(2))
+        print("Final MLA output NaN:", torch.isnan(x).any())
         return x
+
 
 
     
@@ -644,10 +781,23 @@ class Gate(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
         scores = linear(x, self.weight)
+        print("Gate raw scores NaN:", torch.isnan(scores).any())
+        print("Gate raw scores max:", scores.max().item())
+        print("Gate raw scores min:", scores.min().item())
+
+        print("Gate weight stats:", self.weight.min(), self.weight.max(), self.weight.std())
+        print("Raw gate scores:", scores.min(), scores.max(), scores.std())
+        
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
             scores = scores.sigmoid()
+        print("Route scaling factor:", self.route_scale)
+
+        print("Gate scores after softmax/sigmoid NaN:", torch.isnan(scores).any())
+        print("Gate scores after softmax/sigmoid max:", scores.max())
+        print("Gate scores after softmax/sigmoid min:", scores.min())
+
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
@@ -737,30 +887,40 @@ class MoE(nn.Module):
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
         shape = x.size()
         x = x.view(-1, self.dim)
+
+        print("MoE input NaN:", torch.isnan(x).any())
+
         weights, indices = self.gate(x)
+        print("Gate weights NaN:", torch.isnan(weights).any())
+        print("Gate indices NaN:", torch.isnan(indices).any())
+
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
                 continue
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+            expert_input = x[idx]
+            
+            expert_output = expert(expert_input)
+            print(f"Expert {i} input NaN:", torch.isnan(expert_input).any())
+            print(f"Expert {i} output NaN:", torch.isnan(expert_output).any())
+            y[idx] += expert_output * weights[idx, top, None]
+
         z = self.shared_experts(x)
+        print("Shared experts output NaN:", torch.isnan(z).any())
+
         if world_size > 1:
             dist.all_reduce(y)
-        return (y + z).view(shape)
+
+        out = (y + z).view(shape)
+        print("MoE output NaN:", torch.isnan(out).any())
+        return out
+
 
 
 class Block(nn.Module):
@@ -788,21 +948,19 @@ class Block(nn.Module):
         self.ffn_norm = DyT(args.dim)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass for the Transformer block.
+        print("Block Input NaN:", torch.isnan(x).any())
 
-        Args:
-            x (torch.Tensor): Input tensor.
-            start_pos (int): Starting position in the sequence.
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
-            mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+        attn_out = self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        print("Attn Output NaN:", torch.isnan(attn_out).any())
+        
+        x = x + attn_out
+        ffn_out = self.ffn(self.ffn_norm(x))
+        print("FFN Output NaN:", torch.isnan(ffn_out).any())
 
-        Returns:
-            torch.Tensor: Output tensor after block computation.
-        """
-        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + ffn_out
+        print("Block Output NaN:", torch.isnan(x).any())
         return x
+
 
 
 class Transformer(nn.Module):
@@ -877,10 +1035,12 @@ class Transformer(nn.Module):
 
         # Final norm and select the last token (usually cls_token)
         h = self.norm(h)[:, -1]  # shape: (B, dim)
-
+        print("Norm output NaN:", torch.isnan(h).any())
         # Project to class logits
         logits = self.head(h)
-
+        print("Logits before softmax NaN:", torch.isnan(logits).any())
+        print("Logits before softmax max:", logits.max())
+        print("Logits before softmax min:", logits.min())
         # Optional distributed gather across devices
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]

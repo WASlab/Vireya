@@ -1,25 +1,19 @@
 import os
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-
-import time
-import math
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.distributed as dist
-import torch.multiprocessing as mp
-import torch.utils.data.distributed
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-
 import wandb
+from torchvision import datasets, transforms
 
 from vireya.models.model import Transformer
 from vireya.models.configs import small_config, base_config, tiny_config, large_config
-from data import get_dataset
 from vireya.utils.optim import Muon, StepLRScheduler
+
 
 def setup_distributed(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -27,8 +21,45 @@ def setup_distributed(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
+
 def cleanup_distributed():
     dist.destroy_process_group()
+
+
+def adjust_configuration(model):
+    """
+    Randomly adjusts configurations in case of NaNs during forward pass.
+    """
+    new_kv_rank = random.choice([16, 32, 64, 128])
+    print(f"Adjusting KV rank to {new_kv_rank}")
+    
+    model.kv_lora_rank = new_kv_rank
+    model.wkv_a = Linear(model.dim, model.kv_lora_rank + model.qk_rope_head_dim)
+    model.kv_norm = DyT(model.kv_lora_rank)
+    model.wkv_b = ColumnParallelLinear(model.kv_lora_rank, model.n_heads * (model.qk_nope_head_dim + model.v_head_dim))
+
+    return {'kv_lora_rank': new_kv_rank}
+
+
+def check_for_nans_and_retry(model, input_tensor, freqs_cis, max_retries=5):
+    """
+    Tries the forward pass and retries with new configurations if NaNs are encountered.
+    """
+    for attempt in range(max_retries):
+        output = model(input_tensor, freqs_cis=freqs_cis)
+        
+        # Check for NaNs in the output
+        if torch.isnan(output).any():
+            print(f"NaNs detected on attempt {attempt + 1}. Retrying with modified configuration...")
+            new_config = adjust_configuration(model)
+            model.apply_configuration(new_config)
+        else:
+            print(f"Stable output obtained on attempt {attempt + 1}.")
+            return output, True
+
+    print(f"Failed to stabilize after {max_retries} attempts.")
+    return None, False
+
 
 def train(rank, world_size, args):
     setup_distributed(rank, world_size)
@@ -38,7 +69,6 @@ def train(rank, world_size, args):
 
     dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
 
-
     config_map = {
         "tiny": tiny_config,
         "small": small_config,
@@ -46,15 +76,14 @@ def train(rank, world_size, args):
         "large": large_config
     }
 
-    model_args = config_map[args.model](dtype=args.dtype)
-    
-    
+    # Using predefined "small" model config for now, but this could be adjusted dynamically.
+    model_args = small_config(dtype=args.dtype)
     model_args.max_batch_size = args.batch_size
 
     model = Transformer(model_args).to(device)
     model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-
+    # Optimizer and Scheduler
     muon_params, adamw_params = [], []
     for name, param in model.named_parameters():
         if param.ndim == 2 and 'embedding' not in name and 'head' not in name:
@@ -63,16 +92,16 @@ def train(rank, world_size, args):
             adamw_params.append(param)
 
     optimizer = Muon(
-    muon_params=muon_params,
-    adamw_params=adamw_params,
-    lr=args.lr,  # for Muon
-    wd=args.weight_decay,
-    momentum=0.95,
-    nesterov=True,
-    ns_steps=5,
-    adamw_betas=(0.9, 0.999),
-    adamw_eps=1e-8,
-)
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        lr=args.lr,
+        wd=args.weight_decay,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_betas=(0.9, 0.999),
+        adamw_eps=1e-8,
+    )
 
     scheduler = StepLRScheduler(
         optimizer,
@@ -85,15 +114,16 @@ def train(rank, world_size, args):
         decay_type="cosine"
     )
 
-    train_dataset, val_dataset = get_dataset(
-    name=args.dataset,
-    data_dir=args.data_dir if hasattr(args, "data_dir") else "./data"
-)
+    # CIFAR-10 dataset transformation and loader
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank
-    )
-
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -117,14 +147,17 @@ def train(rank, world_size, args):
             inputs = inputs.to(device, dtype=dtype, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-
-
             optimizer.zero_grad()
-            logits = model(inputs)
-            loss = criterion(logits, targets)
-            print("Logits:", logits.min().item(), logits.max().item(), logits.std().item())
-            print("Loss:", loss.item())
 
+            # Fault tolerant forward pass
+            output, success = check_for_nans_and_retry(model, inputs, freqs_cis=None)
+            if not success:
+                print("Model configuration failed to stabilize.")
+                continue
+
+            loss = criterion(output, targets)
+            print("Logits:", output.min().item(), output.max().item(), output.std().item())
+            print("Loss:", loss.item())
 
             loss.backward()
             optimizer.step()
@@ -143,6 +176,7 @@ def train(rank, world_size, args):
         writer.close()
     cleanup_distributed()
 
+
 if __name__ == "__main__":
     import argparse
 
@@ -158,7 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--tensorboard_logdir", type=str, default="runs")
     parser.add_argument("--project_name", type=str, default="efficient-vit")
-    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="cifar10")  # Always CIFAR-10
     parser.add_argument("--model", type=str, choices=["tiny", "small", "base", "large"], default="small")
     parser.add_argument("--dtype", type=str, choices=["bf16", "fp8"], default="bf16")
 

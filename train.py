@@ -1,43 +1,47 @@
 import os
 import sys
-import os
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-
-import time
-import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.utils.data.distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-
 import wandb
 
 from vireya.models.model import Transformer
-from vireya.models.configs import small_config, base_config, tiny_config, large_config
+from vireya.models.configs import tiny_config, small_config, base_config, large_config
 from data import get_dataset
 from vireya.utils.optim import Muon, StepLRScheduler
 
-def setup_distributed(rank, world_size):
+def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-def cleanup_distributed():
+def cleanup():
     dist.destroy_process_group()
 
+def evaluate(model, val_loader, device, dtype):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs = inputs.to(device, dtype=dtype, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=-1)
+            correct += (preds == targets).sum().item()
+            total += targets.size(0)
+    return correct / total
+
 def train(rank, world_size, args):
-    setup_distributed(rank, world_size)
+    setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    torch.set_default_dtype(torch.bfloat16)
-
     dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
-
+    torch.set_default_dtype(dtype)
 
     config_map = {
         "tiny": tiny_config,
@@ -47,13 +51,13 @@ def train(rank, world_size, args):
     }
 
     model_args = config_map[args.model](dtype=args.dtype)
-    
-    
     model_args.max_batch_size = args.batch_size
-
     model = Transformer(model_args).to(device)
-    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
+    if args.compile:
+        model = torch.compile(model)
+
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     muon_params, adamw_params = [], []
     for name, param in model.named_parameters():
@@ -63,16 +67,16 @@ def train(rank, world_size, args):
             adamw_params.append(param)
 
     optimizer = Muon(
-    muon_params=muon_params,
-    adamw_params=adamw_params,
-    lr=args.lr,  # for Muon
-    wd=args.weight_decay,
-    momentum=0.95,
-    nesterov=True,
-    ns_steps=5,
-    adamw_betas=(0.9, 0.999),
-    adamw_eps=1e-8,
-)
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        lr=args.lr,
+        wd=args.weight_decay,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_betas=(0.9, 0.999),
+        adamw_eps=1e-8,
+    )
 
     scheduler = StepLRScheduler(
         optimizer,
@@ -85,22 +89,28 @@ def train(rank, world_size, args):
         decay_type="cosine"
     )
 
-    train_dataset, val_dataset = get_dataset(
-    name=args.dataset,
-    data_dir=args.data_dir if hasattr(args, "data_dir") else "./data"
-)
-
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank
-    )
+    train_dataset, val_dataset = get_dataset(name=args.dataset, data_dir=getattr(args, "data_dir", "./data"))
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
+        sampler=DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True),
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True,
+        drop_last=True
     )
+
+    val_loader = None
+    if rank == 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
 
     criterion = nn.CrossEntropyLoss()
 
@@ -111,26 +121,20 @@ def train(rank, world_size, args):
     model.train()
     global_step = 0
     for epoch in range(args.epochs):
-        train_sampler.set_epoch(epoch)
+        train_loader.sampler.set_epoch(epoch)
         for batch in train_loader:
             inputs, targets = batch
             inputs = inputs.to(device, dtype=dtype, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-
-
             optimizer.zero_grad()
             logits = model(inputs)
             loss = criterion(logits, targets)
-            print("Logits:", logits.min().item(), logits.max().item(), logits.std().item())
-            print("Loss:", loss.item())
-
-
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            if rank == 0:
+            if rank == 0 and global_step % 10 == 0:
                 lr = scheduler.get_lr()
                 wandb.log({"loss": loss.item(), "lr": lr, "step": global_step})
                 writer.add_scalar("Loss/train", loss.item(), global_step)
@@ -138,14 +142,19 @@ def train(rank, world_size, args):
 
             global_step += 1
 
+        # Evaluate after each epoch
+        if rank == 0:
+            val_acc = evaluate(model, val_loader, device, dtype)
+            wandb.log({"val_accuracy": val_acc, "epoch": epoch})
+            writer.add_scalar("Accuracy/val", val_acc, epoch)
+
     if rank == 0:
         wandb.finish()
         writer.close()
-    cleanup_distributed()
+    cleanup()
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=90)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -161,7 +170,6 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--model", type=str, choices=["tiny", "small", "base", "large"], default="small")
     parser.add_argument("--dtype", type=str, choices=["bf16", "fp8"], default="bf16")
-
+    parser.add_argument("--compile", action="store_true")
     args = parser.parse_args()
-    world_size = torch.cuda.device_count()
-    mp.spawn(train, args=(world_size, args), nprocs=world_size)
+    mp.spawn(train, args=(torch.cuda.device_count(), args), nprocs=torch.cuda.device_count())

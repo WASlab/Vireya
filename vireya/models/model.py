@@ -1,7 +1,10 @@
+import os
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() in ("true", "1")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple,Optional,Literal
+from typing import Tuple, Optional, Literal
 from dataclasses import dataclass
 from torch import Tensor
 import math
@@ -208,14 +211,13 @@ class PatchEmbedding(nn.Module):
         assert self.image_size % self.patch_size == 0, "Image size must be divisible by patch size."
 
         self.projection = nn.Conv2d(
-        in_channels=3,
-        out_channels=self.dim,
-        kernel_size=self.patch_size,
-        stride=self.patch_size,
-        bias=True,
-        dtype=Linear.dtype  # Match model precision (bf16 or fp8)
-    )
-
+            in_channels=3,
+            out_channels=self.dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=True,
+            dtype=Linear.dtype  # Match model precision (bf16 or fp8)
+        )
 
         if self.use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, self.dim))
@@ -254,24 +256,47 @@ class PatchEmbedding(nn.Module):
         return x
     
 
-
 world_size: int = 1
 rank: int = 0
 block_size: int = 128
 gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm).
+
+    Args:
+        dim (int): Dimension of the input tensor.
+        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor):
+        """
+        Forward pass for RMSNorm.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Normalized tensor with the same shape as input.
+        """
+        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
 class DyT(nn.Module):
-    def __init__(self,dim,init_alpha=0.5):
+    def __init__(self, dim, init_alpha=0.5):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1)*init_alpha) #Learnable scalar (shared across dim)
         self.gamma = nn.Parameter(torch.ones(dim))          #Learnable per-channel scale
         self.beta = nn.Parameter(torch.zeros(dim))          #Learnable per-channel shift
         
         
-    def forward(self,x):
+    def forward(self, x):
         """
-
         Args:
             x: Input Tensor of Shape [B,T,C] or [*,C] for generic transformer input.
 
@@ -343,7 +368,6 @@ class Linear(nn.Module):
             self.register_parameter("scale", None)
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, dtype=self.weight.dtype))
-
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
@@ -503,9 +527,9 @@ class MLA(nn.Module):
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_nope_head_dim), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_rope_head_dim), persistent=False)
         for name, param in self.named_parameters():
-            
             if torch.isnan(param).any() or torch.isinf(param).any():
-                print(f"Param {name} has NaN or Inf")
+                if DEBUG_MODE:
+                    print(f"Param {name} has NaN or Inf")
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
@@ -522,30 +546,35 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        print("Input x NaN:", torch.isnan(x).any())
-        print("x", x.dtype, x.shape)
-        print("wq weight", self.wq.weight.dtype, self.wq.weight.shape)
+        if DEBUG_MODE:
+            print("Input x NaN:", torch.isnan(x).any())
+            print("x", x.dtype, x.shape)
+            print("wq weight", self.wq.weight.dtype, self.wq.weight.shape)
 
         # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
-        print("Q projection NaN:", torch.isnan(q).any())
+        if DEBUG_MODE:
+            print("Q projection NaN:", torch.isnan(q).any())
 
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_rope = apply_rotary_emb(q_rope, freqs_cis)
-        print("Q_nope NaN:", torch.isnan(q_nope).any())
-        print("Q_rope NaN:", torch.isnan(q_rope).any())
+        if DEBUG_MODE:
+            print("Q_nope NaN:", torch.isnan(q_nope).any())
+            print("Q_rope NaN:", torch.isnan(q_rope).any())
 
         # Key/value compression
         kv = self.wkv_a(x)
         kv, k_rope = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        print("KV compression NaN:", torch.isnan(kv).any())
+        if DEBUG_MODE:
+            print("KV compression NaN:", torch.isnan(kv).any())
 
         k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)  # shape: (B, T, 1, D)
-        print("K_rope expanded NaN:", torch.isnan(k_rope).any())
+        if DEBUG_MODE:
+            print("K_rope expanded NaN:", torch.isnan(k_rope).any())
 
         if attn_impl == "naive":
             kv_proj = self.wkv_b(self.kv_norm(kv))
@@ -558,11 +587,13 @@ class MLA(nn.Module):
 
             q_full = torch.cat([q_nope, q_rope], dim=-1)
             scores = torch.einsum("bshd,bthd->bsht", q_full, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-            print("Scores NaN (naive/compressed):", torch.isnan(scores).any())
-            print("Scores max:", scores.max())
-            print("Scores min:", scores.min())
+            if DEBUG_MODE:
+                print("Scores NaN (naive/compressed):", torch.isnan(scores).any())
+                print("Scores max:", scores.max())
+                print("Scores min:", scores.min())
             attn_out = torch.einsum("bsht,bthd->bshd", scores.softmax(dim=-1), self.v_cache[:bsz, :end_pos])
-            print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
+            if DEBUG_MODE:
+                print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
         else:
             kv_proj = self.kv_norm(kv)
             kv_proj = self.wkv_b(kv_proj)
@@ -577,9 +608,10 @@ class MLA(nn.Module):
                 torch.einsum("bshc,bthc->bsht", q_rope, self.pe_cache[:bsz, :end_pos])
             ) * self.softmax_scale
 
-            print("Scores NaN (compressed):", torch.isnan(scores).any())
-            print("kv_cache NaN:", torch.isnan(self.kv_cache[:bsz, :end_pos]).any())
-            print("pe_cache NaN:", torch.isnan(self.pe_cache[:bsz, :end_pos]).any())
+            if DEBUG_MODE:
+                print("Scores NaN (compressed):", torch.isnan(scores).any())
+                print("kv_cache NaN:", torch.isnan(self.kv_cache[:bsz, :end_pos]).any())
+                print("pe_cache NaN:", torch.isnan(self.pe_cache[:bsz, :end_pos]).any())
 
             attn_out = torch.einsum("bsht,bthc->bshc", scores.softmax(dim=-1), self.kv_cache[:bsz, :end_pos])
 
@@ -594,19 +626,21 @@ class MLA(nn.Module):
             v_proj_w = wkv_b_weight[:, -self.v_head_dim:, :]
             v_proj_w = v_proj_w.transpose(-2, -1).contiguous()
 
-            print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
-            print("v_proj_w NaN:", torch.isnan(v_proj_w).any())
+            if DEBUG_MODE:
+                print("attn_out pre einsum NaN:", torch.isnan(attn_out).any())
+                print("v_proj_w NaN:", torch.isnan(v_proj_w).any())
 
             attn_out = torch.einsum("bshc,hcd->bshd", attn_out, v_proj_w)
 
-        print("Final attn_out NaN:", torch.isnan(attn_out).any())
+        if DEBUG_MODE:
+            print("Final attn_out NaN:", torch.isnan(attn_out).any())
         x = self.wo(attn_out.flatten(2))
-        print("Final MLA output NaN:", torch.isnan(x).any())
+        if DEBUG_MODE:
+            print("Final MLA output NaN:", torch.isnan(x).any())
         return x
 
 
 
-    
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     """
     Precomputes frequency-based complex exponential values for rotary positional embeddings.
@@ -739,6 +773,7 @@ class MLP(nn.Module):
             torch.Tensor: Output tensor after MLP computation.
         """
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        
 class Gate(nn.Module):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
@@ -769,7 +804,9 @@ class Gate(nn.Module):
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
-
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the gating mechanism.
@@ -780,24 +817,26 @@ class Gate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            if DEBUG_MODE:
+                print("Gate input contains NaN or Inf!")
+                print("Gate input stats:", x.min(), x.max(), x.mean(), x.std())
         scores = linear(x, self.weight)
-        print("Gate raw scores NaN:", torch.isnan(scores).any())
-        print("Gate raw scores max:", scores.max().item())
-        print("Gate raw scores min:", scores.min().item())
-
-        print("Gate weight stats:", self.weight.min(), self.weight.max(), self.weight.std())
-        print("Raw gate scores:", scores.min(), scores.max(), scores.std())
-        
+        if DEBUG_MODE:
+            print("Gate raw scores NaN:", torch.isnan(scores).any())
+            print("Gate raw scores max:", scores.max().item())
+            print("Gate raw scores min:", scores.min().item())
+            print("Gate weight stats:", self.weight.min(), self.weight.max(), self.weight.std())
+            print("Raw gate scores:", scores.min(), scores.max(), scores.std())
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
             scores = scores.sigmoid()
-        print("Route scaling factor:", self.route_scale)
-
-        print("Gate scores after softmax/sigmoid NaN:", torch.isnan(scores).any())
-        print("Gate scores after softmax/sigmoid max:", scores.max())
-        print("Gate scores after softmax/sigmoid min:", scores.min())
-
+        if DEBUG_MODE:
+            print("Route scaling factor:", self.route_scale)
+            print("Gate scores after softmax/sigmoid NaN:", torch.isnan(scores).any())
+            print("Gate scores after softmax/sigmoid max:", scores.max())
+            print("Gate scores after softmax/sigmoid min:", scores.min())
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
@@ -890,11 +929,13 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
 
-        print("MoE input NaN:", torch.isnan(x).any())
+        if DEBUG_MODE:
+            print("MoE input NaN:", torch.isnan(x).any())
 
         weights, indices = self.gate(x)
-        print("Gate weights NaN:", torch.isnan(weights).any())
-        print("Gate indices NaN:", torch.isnan(indices).any())
+        if DEBUG_MODE:
+            print("Gate weights NaN:", torch.isnan(weights).any())
+            print("Gate indices NaN:", torch.isnan(indices).any())
 
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
@@ -907,18 +948,21 @@ class MoE(nn.Module):
             expert_input = x[idx]
             
             expert_output = expert(expert_input)
-            print(f"Expert {i} input NaN:", torch.isnan(expert_input).any())
-            print(f"Expert {i} output NaN:", torch.isnan(expert_output).any())
+            if DEBUG_MODE:
+                print(f"Expert {i} input NaN:", torch.isnan(expert_input).any())
+                print(f"Expert {i} output NaN:", torch.isnan(expert_output).any())
             y[idx] += expert_output * weights[idx, top, None]
 
         z = self.shared_experts(x)
-        print("Shared experts output NaN:", torch.isnan(z).any())
+        if DEBUG_MODE:
+            print("Shared experts output NaN:", torch.isnan(z).any())
 
         if world_size > 1:
             dist.all_reduce(y)
 
         out = (y + z).view(shape)
-        print("MoE output NaN:", torch.isnan(out).any())
+        if DEBUG_MODE:
+            print("MoE output NaN:", torch.isnan(out).any())
         return out
 
 
@@ -948,17 +992,21 @@ class Block(nn.Module):
         self.ffn_norm = DyT(args.dim)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        print("Block Input NaN:", torch.isnan(x).any())
+        if DEBUG_MODE:
+            print("Block Input NaN:", torch.isnan(x).any())
 
         attn_out = self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        print("Attn Output NaN:", torch.isnan(attn_out).any())
+        if DEBUG_MODE:
+            print("Attn Output NaN:", torch.isnan(attn_out).any())
         
         x = x + attn_out
         ffn_out = self.ffn(self.ffn_norm(x))
-        print("FFN Output NaN:", torch.isnan(ffn_out).any())
+        if DEBUG_MODE:
+            print("FFN Output NaN:", torch.isnan(ffn_out).any())
 
         x = x + ffn_out
-        print("Block Output NaN:", torch.isnan(x).any())
+        if DEBUG_MODE:
+            print("Block Output NaN:", torch.isnan(x).any())
         return x
 
 
@@ -999,7 +1047,7 @@ class Transformer(nn.Module):
         self.norm = DyT(args.dim)
 
         # Final projection to num_classes
-        self.head = Linear(args.dim, args.num_classes,bias=True)
+        self.head = Linear(args.dim, args.num_classes, bias=True)
 
         # Precompute rotary embeddings up to max_seq_len
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
@@ -1035,12 +1083,14 @@ class Transformer(nn.Module):
 
         # Final norm and select the last token (usually cls_token)
         h = self.norm(h)[:, -1]  # shape: (B, dim)
-        print("Norm output NaN:", torch.isnan(h).any())
+        if DEBUG_MODE:
+            print("Norm output NaN:", torch.isnan(h).any())
         # Project to class logits
         logits = self.head(h)
-        print("Logits before softmax NaN:", torch.isnan(logits).any())
-        print("Logits before softmax max:", logits.max())
-        print("Logits before softmax min:", logits.min())
+        if DEBUG_MODE:
+            print("Logits before softmax NaN:", torch.isnan(logits).any())
+            print("Logits before softmax max:", logits.max())
+            print("Logits before softmax min:", logits.min())
         # Optional distributed gather across devices
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
@@ -1048,5 +1098,3 @@ class Transformer(nn.Module):
             logits = torch.cat(all_logits, dim=-1)
 
         return logits
-
-

@@ -7,22 +7,24 @@ def tiny_config(dtype: str = "bf16") -> ModelArgs:
     return ModelArgs(
         image_size=32,
         patch_size=4,
-        dim=96,
-        inter_dim=384,
-        moe_inter_dim=256,
+        dim=128,
+        inter_dim=512,
+        moe_inter_dim=384,
         n_layers=6,
         n_dense_layers=1,
         n_heads=3,
         n_routed_experts=4,
-        n_shared_experts=1,
+        n_shared_experts=2,
         n_activated_experts=2,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=16,
-        kv_lora_rank=16,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=32,
+        kv_lora_rank=32,
         v_head_dim=32,
         max_seq_len=seq_len + 1,
         original_seq_len=seq_len,
         dtype=dtype,
+        
+        
     )
 
 def small_config(dtype: str = "bf16") -> ModelArgs:
